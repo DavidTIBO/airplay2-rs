@@ -97,10 +97,7 @@ impl TxtRecordParser {
         // Parse group UUID
         let group_id = txt
             .get("gid")
-            .map(|gid| {
-                uuid::Uuid::parse_str(gid)
-                    .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", gid)))
-            })
+            .map(|gid| parse_group_uuid(gid))
             .transpose()?;
 
         // Parse is group leader flag
@@ -127,10 +124,7 @@ impl TxtRecordParser {
         // Parse parent group UUID
         let parent_group_id = txt
             .get("pgid")
-            .map(|pgid| {
-                uuid::Uuid::parse_str(pgid)
-                    .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", pgid)))
-            })
+            .map(|pgid| parse_group_uuid(pgid))
             .transpose()?;
 
         // Parse parent group contains discoverable leader
@@ -142,10 +136,7 @@ impl TxtRecordParser {
         // Parse tight sync UUID
         let tight_sync_id = txt
             .get("tsid")
-            .map(|tsid| {
-                uuid::Uuid::parse_str(tsid)
-                    .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", tsid)))
-            })
+            .map(|tsid| parse_group_uuid(tsid))
             .transpose()?;
 
         Ok(Device {
@@ -448,6 +439,14 @@ impl TxtRecordParser {
             vodka_version: raop.vodka_version.clone(),
         }
     }
+}
+
+/// Parse a group UUID TXT value. Since HomePod OS 27, `gid` may hold several
+/// UUIDs joined by `+` (e.g. `<uuid>+<uuid>`); the first one is used.
+fn parse_group_uuid(value: &str) -> Result<uuid::Uuid, ParseError> {
+    let first = value.split('+').next().unwrap_or(value);
+    uuid::Uuid::parse_str(first)
+        .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", value)))
 }
 
 #[cfg(test)]
@@ -992,6 +991,30 @@ mod tests {
             assert!(!device.features.requires_mfi());
             assert!(device.is_group_leader);
             assert!(device.group_id.is_some());
+        }
+
+        #[test]
+        fn homepod_os27_compound_gid() {
+            // HomePod OS 27 advertises gid as two UUIDs joined by '+'
+            let txt = make_txt(&[
+                ("deviceid", "D6:34:F9:14:40:EA"),
+                ("features", "0x4A7FCA00,0x3C356BD0"),
+                ("model", "AudioAccessory5,1"),
+                ("srcvers", "980.77.2"),
+                (
+                    "gid",
+                    "A774781D-A5D9-46AA-9D79-8198ABAF472A+D55194DE-DD35-4233-9FA5-87ED12B1B623",
+                ),
+            ]);
+
+            let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 10, 140));
+            let device =
+                TxtRecordParser::parse_airplay_txt("HomePodMini", &txt, vec![addr], 7000).unwrap();
+
+            assert_eq!(
+                device.group_id,
+                Some(uuid::Uuid::parse_str("A774781D-A5D9-46AA-9D79-8198ABAF472A").unwrap())
+            );
         }
 
         #[test]

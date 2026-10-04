@@ -118,7 +118,7 @@ impl RaopConnection {
 
         // Add standard headers
         let client_instance = client_device_id.replace(":", "");
-        rtsp.add_session_header("User-Agent", "AirPlay/745.83");
+        rtsp.add_session_header("User-Agent", "AirPlay/999.0.0");
         rtsp.add_session_header("Client-Instance", &client_instance);
         rtsp.add_session_header("DACP-ID", &client_instance);
 

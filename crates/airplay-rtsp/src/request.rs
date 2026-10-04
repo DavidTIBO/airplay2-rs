@@ -176,7 +176,7 @@ impl RtspRequest {
             .header("X-Apple-HKP", hkp.to_string())
             .header("DACP-ID", dacp_id)
             .header("Active-Remote", "1234567890")
-            .header("User-Agent", "AirPlay/745.83")
+            .header("User-Agent", "AirPlay/999.0.0")
             .body(body)
     }
 
