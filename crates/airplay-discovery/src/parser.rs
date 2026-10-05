@@ -4,6 +4,7 @@ use airplay_core::error::ParseError;
 use airplay_core::{Device, DeviceId, Features, Version};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use tracing::warn;
 
 /// Parser for mDNS TXT records.
 pub struct TxtRecordParser;
@@ -97,8 +98,7 @@ impl TxtRecordParser {
         // Parse group UUID
         let group_id = txt
             .get("gid")
-            .map(|gid| parse_group_uuid(gid))
-            .transpose()?;
+            .and_then(|gid| Self::parse_compound_group_uuid("gid", gid));
 
         // Parse is group leader flag
         let is_group_leader = txt
@@ -124,8 +124,7 @@ impl TxtRecordParser {
         // Parse parent group UUID
         let parent_group_id = txt
             .get("pgid")
-            .map(|pgid| parse_group_uuid(pgid))
-            .transpose()?;
+            .and_then(|pgid| Self::parse_compound_group_uuid("pgid", pgid));
 
         // Parse parent group contains discoverable leader
         let parent_group_contains_discoverable_leader = txt
@@ -133,11 +132,12 @@ impl TxtRecordParser {
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
 
-        // Parse tight sync UUID
+        // Parse tight sync UUID (plain UUID only)
+        // Compound values were only observed in gid/pgid. tsid identifies a stereo pair, so
+        // cutting an unknown format down to its leading UUID could merge two different pairs.
         let tight_sync_id = txt
             .get("tsid")
-            .map(|tsid| parse_group_uuid(tsid))
-            .transpose()?;
+            .and_then(|tsid| Self::parse_group_field_uuid("tsid", tsid));
 
         Ok(Device {
             id,
@@ -345,6 +345,33 @@ impl TxtRecordParser {
         Ok(arr)
     }
 
+    /// Parse an optional group identifier that must be a single UUID.
+    ///
+    /// Group identifiers only describe grouping, so an unreadable value is
+    /// logged and treated as absent instead of making the whole receiver
+    /// unusable.
+    fn parse_group_field_uuid(field: &str, value: &str) -> Option<uuid::Uuid> {
+        let parsed = uuid::Uuid::parse_str(value.trim()).ok();
+
+        if parsed.is_none() {
+            warn!(field, value, "ignoring unreadable group identifier");
+        }
+        parsed
+    }
+
+    /// Parse `gid` or `pgid`, which may also use a compound form.
+    ///
+    /// Idle HomePod mini stereo pairs (HomePod software 27.0) advertise
+    /// `<UUID1>+1+<UUID2>`, where the leading UUID equals the pair's `tsid`.
+    /// Only the leading UUID is kept and the meaning of the rest is unknown,
+    /// so two values that differ only after the first `+` become equal here.
+    ///
+    /// Revisit this before comparing these IDs or sending them to a receiver.
+    fn parse_compound_group_uuid(field: &str, value: &str) -> Option<uuid::Uuid> {
+        let leading = value.split_once('+').map_or(value, |(head, _)| head);
+        Self::parse_group_field_uuid(field, leading)
+    }
+
     /// Parse a hex or decimal string to u64.
     fn parse_hex_or_decimal(s: &str) -> u64 {
         let s = s.trim();
@@ -439,14 +466,6 @@ impl TxtRecordParser {
             vodka_version: raop.vodka_version.clone(),
         }
     }
-}
-
-/// Parse a group UUID TXT value. Since HomePod OS 27, `gid` may hold several
-/// UUIDs joined by `+` (e.g. `<uuid>+<uuid>`); the first one is used.
-fn parse_group_uuid(value: &str) -> Result<uuid::Uuid, ParseError> {
-    let first = value.split('+').next().unwrap_or(value);
-    uuid::Uuid::parse_str(first)
-        .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", value)))
 }
 
 #[cfg(test)]
@@ -608,6 +627,70 @@ mod tests {
             assert!(device.group_id.is_none());
             assert!(!device.is_group_leader);
             assert!(!device.requires_password);
+        }
+
+        #[test]
+        fn keeps_leading_uuid_from_compound_group_ids() {
+            // HomePods can advertise "<UUID>+1+<UUID>" instead of a single UUID in
+            // gid and pgid fields.
+            // Shape captured from idle HomePod mini stereo pair (HomePod software 27.0)
+            let pair = "1A2B3C4D-38C0-5C20-80E9-6B6A736DC895";
+            let compound = format!("{pair}+1+5E6F7A8B-82CB-46DE-AA96-991E357D4F23");
+
+            let txt = make_txt(&[
+                ("deviceid", "AA:BB:CC:DD:EE:FF"),
+                ("gid", &compound),
+                ("pgid", &compound),
+                ("tsid", pair),
+            ]);
+
+            let device = TxtRecordParser::parse_airplay_txt("Device", &txt, vec![], 7000).unwrap();
+
+            let pair_uuid = uuid::Uuid::parse_str(pair).unwrap();
+            assert_eq!(device.group_id, Some(pair_uuid));
+            assert_eq!(device.parent_group_id, Some(pair_uuid));
+            assert_eq!(device.tight_sync_id, Some(pair_uuid));
+        }
+
+        #[test]
+        fn compound_tsid_is_ignored_because_it_was_never_observed() {
+            let compound =
+                "1A2B3C4D-38C0-5C20-80E9-6B6A736DC895+1+5E6F7A8B-82CB-46DE-AA96-991E357D4F23";
+            let txt = make_txt(&[("deviceid", "AA:BB:CC:DD:EE:FF"), ("tsid", compound)]);
+
+            let device = TxtRecordParser::parse_airplay_txt("HomePod", &txt, vec![], 7000).unwrap();
+
+            assert!(device.tight_sync_id.is_none());
+        }
+
+        #[test]
+        fn unreadable_group_ids_are_ignored_instead_of_failing() {
+            let txt = make_txt(&[
+                ("deviceid", "AA:BB:CC:DD:EE:FF"),
+                ("gid", "not-a-uuid"),
+                ("pgid", ""),
+                ("tsid", "+1+"),
+            ]);
+
+            let device = TxtRecordParser::parse_airplay_txt("HomePod", &txt, vec![], 7000).unwrap();
+
+            assert!(device.group_id.is_none());
+            assert!(device.parent_group_id.is_none());
+            assert!(device.tight_sync_id.is_none());
+        }
+
+        #[test]
+        fn keeps_leading_uuid_from_standalone_homepod_gid() {
+            // Idle standalone HomePod mini (HomePod software 27.0) advertises
+            // "<UUID1>+<UUID2>" (no "+1+" in the middle) in gid, without tsid.
+            let first = "1A2B3C4D-A5D9-46AA-9D79-8198ABAF472A";
+            let compound = format!("{first}+5E6F7A8B-DD35-4233-9FA5-87ED12B1B623");
+            let txt = make_txt(&[("deviceid", "AA:BB:CC:DD:EE:FF"), ("gid", &compound)]);
+
+            let device = TxtRecordParser::parse_airplay_txt("HomePod", &txt, vec![], 7000).unwrap();
+
+            assert_eq!(device.group_id, Some(uuid::Uuid::parse_str(first).unwrap()));
+            assert!(device.tight_sync_id.is_none());
         }
     }
 
@@ -991,30 +1074,6 @@ mod tests {
             assert!(!device.features.requires_mfi());
             assert!(device.is_group_leader);
             assert!(device.group_id.is_some());
-        }
-
-        #[test]
-        fn homepod_os27_compound_gid() {
-            // HomePod OS 27 advertises gid as two UUIDs joined by '+'
-            let txt = make_txt(&[
-                ("deviceid", "D6:34:F9:14:40:EA"),
-                ("features", "0x4A7FCA00,0x3C356BD0"),
-                ("model", "AudioAccessory5,1"),
-                ("srcvers", "980.77.2"),
-                (
-                    "gid",
-                    "A774781D-A5D9-46AA-9D79-8198ABAF472A+D55194DE-DD35-4233-9FA5-87ED12B1B623",
-                ),
-            ]);
-
-            let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 10, 140));
-            let device =
-                TxtRecordParser::parse_airplay_txt("HomePodMini", &txt, vec![addr], 7000).unwrap();
-
-            assert_eq!(
-                device.group_id,
-                Some(uuid::Uuid::parse_str("A774781D-A5D9-46AA-9D79-8198ABAF472A").unwrap())
-            );
         }
 
         #[test]
