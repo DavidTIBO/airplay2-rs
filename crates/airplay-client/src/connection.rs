@@ -1164,20 +1164,17 @@ impl Connection {
 
                                 if let Some(request) = request {
                                     stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::debug!(
-                                        "Retransmit request: seq={}, count={}",
-                                        request.first_sequence, request.count
-                                    );
                                     // Use block_on to call async handle_retransmit from blocking thread
                                     match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
                                         Ok(retransmitted) => {
                                             if retransmitted > 0 {
                                                 stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
-                                                tracing::info!(
-                                                    "Retransmitted {} packets starting from seq {}",
-                                                    retransmitted, request.first_sequence
-                                                );
                                             }
+                                            // INFO on purpose: each request means the receiver lost audio packets.
+                                            tracing::info!(
+                                                "Receiver requested retransmit: seq {} count {}, resent {}",
+                                                request.first_sequence, request.count, retransmitted
+                                            );
                                         }
                                         Err(e) => {
                                             tracing::warn!("Retransmit failed: {}", e);
@@ -1328,11 +1325,12 @@ impl Connection {
                                         Ok(retransmitted) => {
                                             if retransmitted > 0 {
                                                 stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
-                                                tracing::debug!(
-                                                    "Retransmitted {} packets starting from seq {}",
-                                                    retransmitted, request.first_sequence
-                                                );
                                             }
+                                            // INFO on purpose: each request means the receiver lost audio packets.
+                                            tracing::info!(
+                                                "Receiver requested retransmit: seq {} count {}, resent {}",
+                                                request.first_sequence, request.count, retransmitted
+                                            );
                                         }
                                         Err(e) => {
                                             tracing::warn!("Retransmit failed: {}", e);
