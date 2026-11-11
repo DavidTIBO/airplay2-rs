@@ -1500,22 +1500,12 @@ pub async fn run_bmca_yield_flow(
     // Phase 4: Slave loop (receive Sync/Follow_Up, send Delay_Req, calculate offset)
     // Filter all incoming PTP by source IP — only process messages from our master.
     // Messages from other peers (secondary HomePods sharing ports 319/320) are drained.
-    // ClockOffset convention: offset_ns = master - local (positive = master ahead),
-    // so that `local + offset_ns` gives master time.
-    let mut t1: Option<PtpTimestamp> = None;
-    let mut t2: Option<PtpTimestamp> = None;
-    let mut t3: Option<PtpTimestamp> = None;
-    let mut sync_seq_rx: Option<u16> = None;
+    let mut filter = crate::bmca_clock::BmcaClock::default();
     let mut delay_req_seq: u16 = 0;
-    // gPTP masters (HomePod) do not answer Delay_Req, so the offset is estimated
-    // one-way from Sync/Follow_Up. Network delay only makes (t1 - t2) smaller,
-    // so the max over a window is the least-delayed sample.
-    let mut one_way_samples: std::collections::VecDeque<i128> = std::collections::VecDeque::with_capacity(32);
-    let mut last_sent_offset: Option<i64> = None;
-    let mut have_two_way = false;
-    let mut sample_count: u64 = 0;
-
-    tracing::info!("BMCA: Entering slave loop, syncing to {} (filtering other peers)", master_ip);
+    tracing::info!(
+        "BMCA: Entering slave loop, syncing to {} (filtering other peers)",
+        master_ip
+    );
 
     loop {
         tokio::select! {
@@ -1527,8 +1517,7 @@ pub async fn run_bmca_yield_flow(
                     }
                     if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
                         if header.message_type == PtpMessageType::Sync {
-                            t2 = Some(PtpTimestamp::now());
-                            sync_seq_rx = Some(header.sequence_id);
+                            filter.sync(crate::bmca_clock::Peer {port: header.source_port_identity, domain: header.domain_number}, header.sequence_id, PtpTimestamp::now().to_nanos());
                             tracing::trace!("BMCA slave: Received Sync from {} (seq={})", src.ip(), header.sequence_id);
                         }
                     }
@@ -1541,91 +1530,41 @@ pub async fn run_bmca_yield_flow(
                         continue;
                     }
                     let Ok(header) = PtpHeader::parse(&general_buf[..len]) else { continue };
-                    if header.message_type == PtpMessageType::DelayResp && len >= 44 {
-                        // Delay_Resp is a general message (port 320)
+                    let peer = crate::bmca_clock::Peer {port: header.source_port_identity, domain: header.domain_number};
+                    if header.message_type == PtpMessageType::DelayResp && len >= 54 {
                         if let Ok(t4) = PtpTimestamp::parse(&general_buf[34..44]) {
-                            if let (Some(t1v), Some(t2v), Some(t3v)) = (t1, t2, t3) {
-                                let t1_ns = t1v.to_nanos() as i128;
-                                let t2_ns = t2v.to_nanos() as i128;
-                                let t3_ns = t3v.to_nanos() as i128;
-                                let t4_ns = t4.to_nanos() as i128;
-
-                                let offset_val = ((t1_ns - t2_ns) + (t4_ns - t3_ns)) / 2;
-                                let delay = ((t2_ns - t1_ns) + (t4_ns - t3_ns)) / 2;
-
-                                let clock_offset = ClockOffset {
-                                    offset_ns: offset_val as i64,
-                                    error_ns: (delay.abs() / 2) as u64,
-                                    rtt_ns: delay.abs() as u64,
-                                };
-                                if !have_two_way {
-                                    tracing::info!(
-                                        "BMCA slave: two-way offset={}ns, delay={}ns (Delay_Resp received)",
-                                        clock_offset.offset_ns, clock_offset.rtt_ns
-                                    );
-                                }
-                                have_two_way = true;
-                                let _ = offset_tx.send(clock_offset);
+                            let requester: [u8;10] = general_buf[44..54].try_into().unwrap();
+                            if let Some(offset) = filter.response(peer, header.sequence_id, requester, t4.to_nanos(), std::time::Instant::now()) {
+                                tracing::info!(offset_ns=offset.offset_ns, "BMCA validated two-way clock offset");
+                                let _ = offset_tx.send(offset);
                             }
-                            t3 = None;
                         }
                         continue;
                     }
                     if header.message_type == PtpMessageType::FollowUp && len >= 44 {
-                            if let Ok(ts) = PtpTimestamp::parse(&general_buf[34..44]) {
-                                t1 = Some(ts);
-                                tracing::trace!("BMCA slave: Received Follow_Up from {} (seq={}, t1={}.{:09}s)",
-                                    src.ip(), header.sequence_id, ts.seconds, ts.nanoseconds);
-
-                                if let (Some(t2v), Some(seq)) = (t2, sync_seq_rx) {
-                                    if seq == header.sequence_id && !have_two_way {
-                                        let sample = ts.to_nanos() as i128 - t2v.to_nanos() as i128;
-                                        if one_way_samples.len() == 32 {
-                                            one_way_samples.pop_front();
-                                        }
-                                        one_way_samples.push_back(sample);
-                                        sample_count += 1;
-                                        let best = *one_way_samples.iter().max().unwrap();
-                                        let spread = best - *one_way_samples.iter().min().unwrap();
-                                        let offset_ns = best as i64;
-                                        if sample_count == 1 || sample_count % 64 == 0 {
-                                            tracing::info!(
-                                                "BMCA slave: one-way offset={}ns (master t1={}.{:09}s, samples={}, spread={}ns)",
-                                                offset_ns, ts.seconds, ts.nanoseconds, sample_count, spread
-                                            );
-                                        }
-                                        // Avoid churning the streamer for sub-0.5ms changes
-                                        if last_sent_offset.map_or(true, |prev| (prev - offset_ns).abs() > 500_000) {
-                                            let _ = offset_tx.send(ClockOffset {
-                                                offset_ns,
-                                                error_ns: (spread / 2) as u64,
-                                                rtt_ns: 0,
-                                            });
-                                            last_sent_offset = Some(offset_ns);
-                                        }
-                                    }
-                                }
-
-                                // Send Delay_Req
-                                delay_req_seq = delay_req_seq.wrapping_add(1);
-                                let mut delay_header = PtpHeader::new(PtpMessageType::DelayReq, delay_req_seq);
-                                let mut delay_src_port = [0u8; 10];
-                                delay_src_port[..8].copy_from_slice(&clock_identity);
-                                delay_src_port[8..10].copy_from_slice(&1u16.to_be_bytes());
-                                delay_header.source_port_identity = delay_src_port;
-
-                                t3 = Some(PtpTimestamp::now());
-
-                                let mut delay_packet = [0u8; 44];
-                                delay_packet[..34].copy_from_slice(&delay_header.serialize());
-                                delay_packet[34..44].copy_from_slice(&t3.unwrap().serialize());
-
-                                if let Err(e) = event_socket.send_to(&delay_packet, event_dest).await {
-                                    tracing::warn!("BMCA slave: Failed to send Delay_Req: {}", e);
-                                } else {
-                                    tracing::trace!("BMCA slave: Sent Delay_Req (seq={})", delay_req_seq);
-                                }
+                        if let Ok(ts) = PtpTimestamp::parse(&general_buf[34..44]) {
+                            let Some(pair) = filter.follow_up(peer, header.sequence_id, ts.to_nanos()) else { continue };
+                            if let Some(offset) = filter.one_way(pair, std::time::Instant::now()) {
+                                tracing::info!(offset_ns=offset.offset_ns, observed_jitter_ns=offset.error_ns, "BMCA one-way clock offset");
+                                let _ = offset_tx.send(offset);
                             }
+                            delay_req_seq = delay_req_seq.wrapping_add(1);
+                            let mut delay_header = PtpHeader::new(PtpMessageType::DelayReq, delay_req_seq);
+                            let mut requester = [0u8;10];
+                            requester[..8].copy_from_slice(&clock_identity);
+                            requester[8..].copy_from_slice(&1u16.to_be_bytes());
+                            delay_header.source_port_identity = requester;
+                            delay_header.domain_number = header.domain_number;
+                            let t3 = PtpTimestamp::now();
+                            let mut packet = [0u8;44];
+                            packet[..34].copy_from_slice(&delay_header.serialize());
+                            packet[34..].copy_from_slice(&t3.serialize());
+                            if let Err(e) = event_socket.send_to(&packet, event_dest).await {
+                                tracing::warn!("BMCA Delay_Req failed: {}",e);
+                            } else {
+                                filter.request(pair, delay_req_seq, requester, t3.to_nanos(), std::time::Instant::now());
+                            }
+                        }
                     }
                 }
             }

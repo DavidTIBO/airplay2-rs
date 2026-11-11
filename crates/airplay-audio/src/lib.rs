@@ -31,3 +31,5 @@ pub use buffer::{AudioBuffer, AudioFrame};
 pub use streamer::AudioStreamer;
 pub use live_policy::{LiveStreamOptions, LiveDiagnostics, LiveDiagnosticsSnapshot};
 pub use traits::{AudioSource, EncoderTrait};
+
+mod live_timeline;

@@ -473,11 +473,7 @@ struct StreamerInner {
     use_ptp_sync: bool,
     /// PTP master clock identity (from BMCA, used in PT=87 packets).
     ptp_master_clock_id: [u8; 8],
-    /// Live mode: (wall time, RTP timestamp) of the first packet, used to keep
-    /// the RTP timeline locked to real time across capture gaps.
-    live_anchor: Option<(Instant, u64)>,
-    /// Live mode: samples added to decoder timestamps to skip lost time.
-    live_ts_offset: u64,
+    live_timeline: crate::live_timeline::LiveTimeline,
 }
 
 /// High-level audio streamer.
@@ -551,8 +547,7 @@ impl AudioStreamer {
                 render_delay_ns: 0,
                 use_ptp_sync: false,
                 ptp_master_clock_id: [0u8; 8],
-                live_anchor: None,
-                live_ts_offset: 0,
+                live_timeline: Default::default(),
             })),
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
@@ -942,7 +937,7 @@ impl AudioStreamer {
     pub async fn reset_after_flush(&mut self) {
         let mut inner = self.inner.lock().await;
         inner.first_packet_sent = false;
-        inner.live_anchor = None;
+        inner.live_timeline.reset();
         for sender in &mut inner.rtp_senders {
             sender.reset_sync_state();
         }
@@ -1274,7 +1269,7 @@ async fn run_streamer(
                 if guard.live_options.max_age.is_some() && guard.metrics.packets_sent.load(Ordering::Relaxed) == 0
                     && guard.metrics.force_sync.load(Ordering::Acquire) {
                     guard.first_packet_sent = false;
-                    guard.live_anchor = None;
+                    guard.live_timeline.reset();
                 }
                 // Set marker bit on first audio packet (required by some receivers)
                 let first_packet = !guard.first_packet_sent;
@@ -1289,21 +1284,11 @@ async fn run_streamer(
                     // timeline permanently behind real time and the receiver drops
                     // every packet as late once the lag exceeds its buffer. Skip
                     // the lost time instead; the timestamp jump forces a new sync.
-                    let now = Instant::now();
-                    let base = frame.timestamp + guard.live_ts_offset;
-                    let (anchor_at, anchor_ts) = *guard.live_anchor.get_or_insert((now, base));
-                    let expected = anchor_ts
-                        + (now.saturating_duration_since(anchor_at).as_nanos() * sample_rate as u128
-                            / 1_000_000_000) as u64;
-                    let lag = expected.saturating_sub(base);
-                    if lag > sample_rate as u64 / 50 {
-                        guard.live_ts_offset += lag;
-                        tracing::info!(
-                            "Live RTP timeline {:.1} ms behind real time, skipping ahead",
-                            lag as f64 * 1000.0 / sample_rate as f64
-                        );
+                    let (timestamp, skipped) = guard.live_timeline.timestamp(frame.timestamp, Instant::now(), sample_rate);
+                    if skipped > 0 {
+                        tracing::info!(skipped_ms=skipped as f64 * 1000.0 / sample_rate as f64, "Live RTP timeline caught up after capture gap");
                     }
-                    (frame.timestamp + guard.live_ts_offset) as u32
+                    timestamp
                 } else {
                     packet.timestamp as u32
                 };
