@@ -15,6 +15,14 @@ use tokio::time::timeout;
 use crate::traits::RtspTransport;
 use crate::{RtspRequest, RtspResponse};
 
+/// Error for a connection the receiver has closed (end of stream).
+fn peer_closed_error() -> CoreError {
+    CoreError::Connection(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "receiver closed the RTSP connection",
+    ))
+}
+
 /// RTSP connection to an AirPlay receiver.
 pub struct RtspConnection {
     addr: SocketAddr,
@@ -23,6 +31,8 @@ pub struct RtspConnection {
     stream: Option<TcpStream>,
     /// An interrupted request leaves framing/cipher state ambiguous. Require a new session.
     request_in_flight: bool,
+    /// The receiver closed the connection; the session cannot be reused.
+    peer_closed: bool,
     /// Session headers added to all requests
     session_headers: HashMap<String, String>,
 }
@@ -36,6 +46,7 @@ impl RtspConnection {
             cipher: None,
             stream: None,
             request_in_flight: false,
+            peer_closed: false,
             session_headers: HashMap::new(),
         }
     }
@@ -47,6 +58,7 @@ impl RtspConnection {
             .map_err(|_| RtspError::ConnectionRefused)?;
         self.stream = Some(stream);
         self.request_in_flight = false;
+        self.peer_closed = false;
         Ok(())
     }
 
@@ -81,7 +93,26 @@ impl RtspConnection {
     }
 
     /// Send request and receive response.
-    pub async fn send(&mut self, mut request: RtspRequest) -> Result<RtspResponse> {
+    ///
+    /// Once the receiver has closed the connection (end of stream), every
+    /// later request fails with the same `UnexpectedEof` connection error, so
+    /// callers can tell "the receiver ended the session" apart from a
+    /// transport failure, whichever request noticed the close first.
+    pub async fn send(&mut self, request: RtspRequest) -> Result<RtspResponse> {
+        if self.peer_closed {
+            return Err(peer_closed_error());
+        }
+        let result = self.send_once(request).await;
+        if let Err(CoreError::Connection(error)) = &result {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                self.peer_closed = true;
+                self.stream = None;
+            }
+        }
+        result
+    }
+
+    async fn send_once(&mut self, mut request: RtspRequest) -> Result<RtspResponse> {
         if self.request_in_flight {
             self.stream = None;
             return Err(RtspError::InvalidResponse("previous RTSP request was interrupted; reconnect required".into()).into());
@@ -179,7 +210,7 @@ impl RtspConnection {
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).await? == 0 {
-                return Err(RtspError::InvalidResponse("RTSP peer closed before response headers".into()).into());
+                return Err(peer_closed_error());
             }
             response_data.extend_from_slice(line.as_bytes());
 
@@ -369,6 +400,33 @@ mod tests {
             // Even if not connected, close should succeed
             let result = conn.close().await;
             assert!(result.is_ok());
+            assert!(!conn.is_connected());
+        }
+
+        #[tokio::test]
+        async fn a_receiver_close_is_reported_to_every_later_request() {
+            // A receiver that ends the session with a clean close (FIN), as a
+            // HomePod does when another device takes it over. The socket stays
+            // open so the requests still written to it are not answered by a reset.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let receiver = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.shutdown().await.unwrap();
+                socket
+            });
+            let mut conn = RtspConnection::new(addr);
+            conn.connect().await.unwrap();
+            let _receiver_socket = receiver.await.unwrap();
+
+            for request in [RtspRequest::get_info(), RtspRequest::feedback("*")] {
+                match conn.send(request).await {
+                    Err(CoreError::Connection(error)) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof)
+                    }
+                    other => panic!("expected a receiver close, got {other:?}"),
+                }
+            }
             assert!(!conn.is_connected());
         }
 

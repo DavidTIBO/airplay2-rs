@@ -127,6 +127,51 @@ impl RtspResponse {
             Err(RtspError::UnexpectedStatus(self.status_code).into())
         }
     }
+
+    /// Fail with [`RtspError::ReceiverInUse`] when the receiver says another
+    /// device is playing.
+    ///
+    /// Only an explicit reason in the status line counts: a generic 4xx or a
+    /// "Busy" response does not establish that another device is playing.
+    pub fn check_receiver_in_use(&self) -> Result<()> {
+        let reason = self.status_text.to_ascii_lowercase();
+        if !self.is_success()
+            && ["in use by another device", "already playing from another device"]
+                .iter()
+                .any(|explicit| reason.contains(explicit))
+        {
+            return Err(RtspError::ReceiverInUse.into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod receiver_in_use_tests {
+    use super::*;
+
+    fn parse(status: &str) -> RtspResponse {
+        RtspResponse::parse(format!("RTSP/1.0 {status}\r\nCSeq: 1\r\n\r\n").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn explicit_occupancy_is_classified_as_in_use() {
+        assert!(matches!(
+            parse("409 In use by another device").check_receiver_in_use(),
+            Err(airplay_core::Error::Rtsp(RtspError::ReceiverInUse))
+        ));
+        assert!(matches!(
+            parse("453 Already playing from another device").check_receiver_in_use(),
+            Err(airplay_core::Error::Rtsp(RtspError::ReceiverInUse))
+        ));
+    }
+
+    #[test]
+    fn generic_failures_and_successes_are_not_in_use() {
+        assert!(parse("453 Not Enough Bandwidth").check_receiver_in_use().is_ok());
+        assert!(parse("503 Busy").check_receiver_in_use().is_ok());
+        assert!(parse("200 OK").check_receiver_in_use().is_ok());
+    }
 }
 
 /// Parse status line: "RTSP/1.0 200 OK"
