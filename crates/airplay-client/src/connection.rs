@@ -226,6 +226,55 @@ pub struct Connection {
     stream_stats: Arc<crate::stats::StreamStats>,
 }
 
+/// How long to wait for the first PTP clock offset from the receiver.
+const FIRST_PTP_OFFSET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for the first clock offset published by the PTP task.
+///
+/// The channel starts with a default (zero) offset that was never measured, so
+/// it must not be used: streaming against it schedules audio at the wrong time.
+/// Fails with [`StreamingError::PtpNegotiation`] if no offset arrives in time or
+/// if the PTP task ended without publishing one.
+///
+/// [`StreamingError::PtpNegotiation`]: airplay_core::StreamingError::PtpNegotiation
+async fn first_ptp_offset(offsets: &mut watch::Receiver<ClockOffset>) -> Result<ClockOffset> {
+    match tokio::time::timeout(FIRST_PTP_OFFSET_TIMEOUT, offsets.changed()).await {
+        Ok(Ok(())) => Ok(*offsets.borrow_and_update()),
+        _ => Err(airplay_core::StreamingError::PtpNegotiation.into()),
+    }
+}
+
+#[cfg(test)]
+mod ptp_negotiation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_published_zero_offset_is_valid() {
+        let (sender, mut offsets) = watch::channel(ClockOffset::default());
+        sender.send(ClockOffset::default()).unwrap();
+        assert_eq!(first_ptp_offset(&mut offsets).await.unwrap().offset_ns, 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_channel_does_not_use_the_default_offset() {
+        let (sender, mut offsets) = watch::channel(ClockOffset::default());
+        drop(sender);
+        assert!(matches!(
+            first_ptp_offset(&mut offsets).await,
+            Err(CoreError::Streaming(airplay_core::StreamingError::PtpNegotiation))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_offset_in_time_is_a_negotiation_failure() {
+        let (_sender, mut offsets) = watch::channel(ClockOffset::default());
+        assert!(matches!(
+            first_ptp_offset(&mut offsets).await,
+            Err(CoreError::Streaming(airplay_core::StreamingError::PtpNegotiation))
+        ));
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         self.streamer = None;
@@ -925,16 +974,16 @@ impl Connection {
                                 tracing::info!("BMCA complete: HomePod clock ID = {:02x?}", clock_id);
                             }
                             Ok(Err(_)) => {
-                                tracing::warn!("BMCA: clock ID channel closed unexpectedly");
+                                warn!("BMCA: clock ID channel closed before the receiver answered");
+                                return Err(airplay_core::StreamingError::PtpNegotiation.into());
                             }
                             Err(_) => {
-                                tracing::warn!("BMCA: timeout waiting for clock ID (5s)");
+                                warn!("BMCA: timeout waiting for clock ID (5s)");
+                                return Err(airplay_core::StreamingError::PtpNegotiation.into());
                             }
                         }
 
-                        // Wait briefly for initial offset calculation
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let initial_offset = *offset_rx.borrow_and_update();
+                        let initial_offset = first_ptp_offset(&mut offset_rx).await?;
                         self.timing_offset = Some(initial_offset);
 
                         tracing::info!("gPTP BMCA initialized (offset: {} ns, clock_id: {:02x?})",
@@ -965,11 +1014,7 @@ impl Connection {
 
                         self.timing_task = Some(ptp_task);
 
-                        // Wait a moment for initial sync before proceeding
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                        // Get the current offset from the channel
-                        let initial_offset = *offset_rx.borrow_and_update();
+                        let initial_offset = first_ptp_offset(&mut offset_rx).await?;
                         self.timing_offset = Some(initial_offset);
 
                         tracing::info!("PTP slave initialized (initial offset: {} ns)", initial_offset.offset_ns);

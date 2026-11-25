@@ -117,6 +117,10 @@ pub enum RtspError {
 /// Errors during audio streaming.
 #[derive(Error, Debug)]
 pub enum StreamingError {
+    /// The receiver never provided a usable PTP clock reference.
+    #[error("PTP clock negotiation failed")]
+    PtpNegotiation,
+
     #[error("Encoding error: {0}")]
     Encoding(String),
 
